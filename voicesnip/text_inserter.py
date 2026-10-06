@@ -45,6 +45,9 @@ YDOTOOL_SOCKET_ENV = os.environ.get("YDOTOOL_SOCKET")
 # Shortcut used to paste. Terminal emulators need ctrl+shift+v instead.
 PASTE_SHORTCUT = os.environ.get("VOICESNIP_PASTE_SHORTCUT", "ctrl+v").strip().lower()
 
+# Which argument syntax "ydotool key" wants here; probed once, on first use.
+_YDOTOOL_USES_KEYCODES = None
+
 # "paste" (clipboard, layout- and unicode-safe) or "type" (ydotool type).
 INSERT_METHOD = os.environ.get("VOICESNIP_INSERT_METHOD", "paste").strip().lower()
 
@@ -150,11 +153,40 @@ def _ydotool_env(socket_path):
     return env
 
 
+def _ydotool_uses_keycodes():
+    """Whether the installed ydotool wants "<keycode>:<pressed>" or key names.
+
+    The syntax has to be decided before the key is sent, because neither
+    version rejects the other's. 0.1.x does not recognise a token like "29:1",
+    falls back to the token's first character and types digits ("ctrl+v"
+    becomes "2442"), and it drops its tool's return code, so it exits 0 either
+    way. 1.x takes an unknown key name as KEY_RESERVED and also exits 0.
+    Trying one syntax and falling back on failure therefore cannot work in
+    either direction.
+
+    "ydotool help" is handled in every release before the socket or
+    /dev/uinput is touched, so running it has no side effects. It exits 1 on
+    0.1.5 through 0.2.0 and 0 on 1.0.0 through 1.0.4.
+    """
+    global _YDOTOOL_USES_KEYCODES
+    if _YDOTOOL_USES_KEYCODES is None:
+        try:
+            probe = subprocess.run(["ydotool", "help"],
+                                   capture_output=True, timeout=5.0)
+            _YDOTOOL_USES_KEYCODES = probe.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            # If the probe cannot run, assume the older syntax. Guessing wrong
+            # that way sends KEY_RESERVED and pastes nothing; guessing wrong
+            # the other way types digits into the user's document.
+            _YDOTOOL_USES_KEYCODES = False
+    return _YDOTOOL_USES_KEYCODES
+
+
 def _shortcut_keycodes(shortcut):
     """Translate "ctrl+shift+v" into ydotool >= 1.0 "<keycode>:<pressed>" args.
 
     Returns None when the shortcut contains a key this module has no keycode
-    for; the caller then falls back to the ydotool 0.1.x key-name syntax.
+    for.
     """
     parts = [p for p in shortcut.split("+") if p]
     if not parts:
@@ -178,32 +210,32 @@ def _send_paste_shortcut(socket_path):
     """Press the paste shortcut via ydotool.
 
     ydotool >= 1.0 understands only raw keycode pairs, 0.1.x understands only
-    key names. Try keycodes first and fall back to the name syntax so both
-    versions work without probing the version.
+    key names, and both accept the other's syntax silently - so the version is
+    probed once and the right syntax is used from the start.
 
     Returns:
-        True if one of the syntaxes was accepted.
+        True if ydotool accepted the shortcut.
     """
-    env = _ydotool_env(socket_path)
-    attempts = []
-    keycodes = _shortcut_keycodes(PASTE_SHORTCUT)
-    if keycodes:
-        attempts.append(keycodes)
-    attempts.append([PASTE_SHORTCUT])
+    if _ydotool_uses_keycodes():
+        args = _shortcut_keycodes(PASTE_SHORTCUT)
+        if args is None:
+            print(f"No keycode for the paste shortcut '{PASTE_SHORTCUT}'; "
+                  f"set VOICESNIP_PASTE_SHORTCUT to a simpler combination")
+            return False
+    else:
+        args = [PASTE_SHORTCUT]
 
-    for args in attempts:
-        try:
-            subprocess.run(
-                ["ydotool", "key"] + args,
-                check=True,
-                timeout=5.0,
-                env=env,
-            )
-            return True
-        except subprocess.CalledProcessError:
-            continue
-    print(f"ydotool rejected the paste shortcut '{PASTE_SHORTCUT}'")
-    return False
+    try:
+        subprocess.run(
+            ["ydotool", "key"] + args,
+            check=True,
+            timeout=5.0,
+            env=_ydotool_env(socket_path),
+        )
+        return True
+    except subprocess.CalledProcessError:
+        print(f"ydotool rejected the paste shortcut '{PASTE_SHORTCUT}'")
+        return False
 
 
 def _type_text_wayland(text, socket_path):
